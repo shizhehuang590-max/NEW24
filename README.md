@@ -1,0 +1,314 @@
+[index (36).html](https://github.com/user-attachments/files/27552651/index.36.html)
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RF PA Optimizer - Pure Benchmark (5 Methods x 10 Seeds)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #080c1c; font-family: 'Segoe UI', system-ui, sans-serif; color: #e0e0ec; padding: 30px; overflow-x: hidden; }
+  h1 { font-size: 24px; font-weight: 800; background: linear-gradient(90deg, #22d3ee, #4ade80, #f0c040); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-align: center; margin-bottom: 5px; }
+  .sub { text-align: center; font-size: 13px; color: #94a3b8; margin-bottom: 30px; }
+  
+  #runBtn { display: block; margin: 0 auto 30px; padding: 14px 30px; font-size: 16px; font-weight: bold; background: linear-gradient(135deg, #0ea5e9, #2563eb); color: #fff; border: none; border-radius: 8px; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 15px rgba(14, 165, 233, 0.4); }
+  #runBtn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(14, 165, 233, 0.6); }
+  #runBtn:disabled { background: #334155; cursor: not-allowed; transform: none; box-shadow: none; color: #94a3b8; }
+
+  .dashboard { display: none; }
+  .charts-container { display: flex; flex-direction: column; align-items: center; gap: 20px; margin-bottom: 40px; }
+  .chart-box { background: rgba(10, 14, 28, 0.9); border: 1px solid #1e1e32; border-radius: 12px; padding: 20px; width: 100%; max-width: 800px; height: 400px; }
+  
+  .tables-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 25px; }
+  .table-card { background: rgba(10, 14, 28, 0.9); border: 1px solid #1e1e32; border-radius: 12px; padding: 15px; overflow-x: auto; }
+  .table-card h3 { font-size: 16px; margin-bottom: 12px; color: #f0c040; border-bottom: 1px solid #1e1e32; padding-bottom: 8px; text-align: center; }
+  
+  table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: center; }
+  th { background: rgba(255, 255, 255, 0.05); color: #94a3b8; padding: 10px 6px; font-weight: 600; white-space: nowrap; }
+  td { padding: 8px 6px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); font-family: monospace; }
+  tr:hover { background: rgba(255, 255, 255, 0.05); }
+  
+  /* 顏色與不合規格的標記樣式 */
+  .cyan { color: #22d3ee; } 
+  .green { color: #4ade80; } 
+  .gold { color: #f0c040; }
+  .out-of-spec { 
+    background-color: rgba(239, 68, 68, 0.2) !important; 
+    color: #fca5a5 !important; 
+    font-weight: 800; 
+  }
+</style>
+</head>
+<body>
+
+<h1>📊 3.5 GHz PA — Optimization Benchmark</h1>
+<div class="sub">TSMC 28nm RF · 5 Algorithms · 10 Random Seeds (紅色標示為未達 Spec 下限之參數)</div>
+
+<button id="runBtn">🚀 開始執行跑分 (Run Benchmark)</button>
+
+<div class="dashboard" id="dash">
+  <div class="charts-container">
+    <div class="chart-box"><canvas id="barChart"></canvas></div>
+  </div>
+  <div class="tables-grid" id="tablesArea"></div>
+</div>
+
+<script>
+let rng = Math.random;
+function seedRandom(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x9e3779b9 | 0;
+    let t = seed ^ seed >>> 16;
+    t = Math.imul(t, 0x21f0aaad);
+    t = t ^ t >>> 15;
+    t = Math.imul(t, 0x735a2d97);
+    return ((t = t ^ t >>> 15) >>> 0) / 4294967296;
+  }
+}
+
+const F0=3.5e9, W0=2*Math.PI*3.5e9;
+const VDD_D=1.8, VDD_F=3.3, VTH=0.40;
+const GM_ID=10.0, ID_DENS=0.30e-3, CGS_UM=1.8e-15;
+const Q_LD=13, Q_LM=11, Q_IND_IN=14;
+const FINGER_PITCH=2.0, RG_SQ=15.0;
+
+// 定義的規格限制
+const SPECS = {
+  pout:  {min:23, ideal:26, max:28,  w:.28, dir:'hi'},
+  pae:   {min:28, ideal:42, max:58,  w:.26, dir:'hi'},
+  gain:  {min:22, ideal:26, max:32,  w:.18, dir:'hi'},
+  op1db: {min:19, ideal:22, max:26,  w:.15, dir:'hi'},
+  s11:   {min:-22,ideal:-15,max:-8,  w:.13, dir:'lo'},
+};
+
+const PDEFS = {
+  Wd: {min:20, max:80,  step:4},
+  Wf: {min:80, max:240, step:8},
+  Ld: {min:0.5,max:3.0, step:0.05},
+  Lm: {min:0.5,max:3.0, step:0.05},
+  Vgs:{min:0.42,max:0.62,step:0.01},
+};
+
+function analyzePA(p) {
+  const Wd=p.Wd, Wf=p.Wf, Ld_H=p.Ld*1e-9, Lm_H=p.Lm*1e-9, Vgs=p.Vgs;
+  const Vov = Math.max(Vgs - VTH, 0.02);
+  const vn  = Math.min(Vov / 0.05, 3.0);
+  const Id_d = Wd * ID_DENS * vn, Id_f = Wf * ID_DENS * vn;
+  const gm_d = GM_ID * Id_d, gm_f = GM_ID * Id_f;
+  const Cload  = 3.0e-12 + 0.5e-15 * Wf;
+  const f_res  = 1.0 / (2*Math.PI*Math.sqrt(Ld_H * Cload));
+  const f_err  = Math.abs(f_res - F0) / F0;
+  const Qm     = Math.exp(-3.5 * f_err * f_err);
+  const Vswing   = (VDD_F - 0.35) * 0.92;
+  const Ropt     = Vswing / (2.0 * Math.max(Id_f, 1e-9));
+  const Pout_W   = 0.5 * Vswing * Vswing / Ropt * Qm;
+  const Pout_dBm = 10 * Math.log10(Math.max(Pout_W * 1000, 1e-4));
+  const Rp_Lm = Q_LM * W0 * Lm_H, Rp_Ld = Q_LD * W0 * Ld_H;
+  const Gd_dB = 10 * Math.log10(Math.max(gm_d * Rp_Lm, 1e-9)) - 5.0;
+  const Gf_dB = 10 * Math.log10(Math.max(gm_f * Math.min(Rp_Ld, Ropt*2.5), 1e-9)) - 1.5;
+  const Gain  = (Gd_dB + Gf_dB) * Qm + (1 - Qm) * 3;
+  const Ipk_f = 2 * Pout_W / Math.max(Vswing, 0.1);
+  const Idc_f = Id_f + Math.max(0, Ipk_f - Id_f) / Math.PI;
+  const PDC   = (VDD_D * Id_d + VDD_F * Idc_f) * 1000;
+  const Pin_mW = Pout_W * 1000 / Math.max(Math.pow(10, Gain/10), 0.01);
+  const PAE   = Math.min(60, Math.max(0, 100*(Pout_W*1000 - Pin_mW) / Math.max(PDC,1)));
+  const nFD  = Math.max(1, Math.round(Wd / FINGER_PITCH));
+  const Rg_d = RG_SQ / nFD;
+  const Qtr  = Math.sqrt(Math.max(50.0 / Math.max(Rg_d, 0.01) - 1.0, 0.5));
+  const S11  = Math.max(-30, Math.min(-5, -28.0 + 18.0 * Math.min(Qtr / Q_IND_IN, 1.3)));
+  const OP1dB = Pout_dBm - 2.8;
+  return { Gain, Pout_dBm, PAE, S11, OP1dB };
+}
+
+function fitness(a) {
+  let sc=0, tw=0;
+  Object.entries(SPECS).forEach(([k,sp]) => {
+    const v = a[k==='pout'?'Pout_dBm':k==='pae'?'PAE':k==='gain'?'Gain':k==='op1db'?'OP1dB':'S11'];
+    let s;
+    if (sp.dir==='lo') s = v<=sp.ideal?1 : v<=sp.max?1-.7*((v-sp.ideal)/(sp.max-sp.ideal)) : Math.max(0,.3*Math.exp(-(v-sp.max)/Math.abs(sp.max)));
+    else               s = v>=sp.ideal?1 : v>=sp.min?.3+.7*((v-sp.min)/(sp.ideal-sp.min)) : Math.max(0,.3*Math.exp(-(sp.min-v)/Math.abs(sp.min||1)));
+    sc += s*sp.w; tw += sp.w;
+  });
+  return sc/tw;
+}
+
+function clampP(p) {
+  const o={};
+  Object.entries(PDEFS).forEach(([k,d])=>{ o[k]=Math.round(Math.max(d.min,Math.min(d.max,p[k]))/d.step)*d.step; });
+  return o;
+}
+
+function runGD(start, maxIter) {
+  let cur=clampP({...start}), a=analyzePA(cur), f=fitness(a);
+  let best={fitness:f,params:{...cur},a};
+  const lr={Wd:5,Wf:12,Ld:.2,Lm:.2,Vgs:.012};
+  const mom={Wd:0,Wf:0,Ld:0,Lm:0,Vgs:0};
+  let lrs=1, stag=0;
+  for (let i=0;i<maxIter;i++) {
+    if (f>best.fitness){best={fitness:f,params:{...cur},a};stag=0;}else stag++;
+    if (f>.97) break;
+    if (stag>16) {
+      Object.entries(PDEFS).forEach(([k,d])=>{cur[k]+=(rng()-.5)*(d.max-d.min)*.12;});
+      cur=clampP(cur);a=analyzePA(cur);f=fitness(a);lrs=1;stag=0;Object.keys(mom).forEach(k=>mom[k]=0); continue;
+    }
+    const grad={};
+    Object.entries(PDEFS).forEach(([k,d])=>{
+      const h=d.step*.5;
+      const pp=clampP({...cur,[k]:cur[k]+h}), pm=clampP({...cur,[k]:cur[k]-h});
+      grad[k]=(fitness(analyzePA(pp))-fitness(analyzePA(pm)))/((pp[k]-pm[k])||1e-12);
+    });
+    const nx={};
+    Object.entries(PDEFS).forEach(([k])=>{ mom[k]=.85*mom[k]+.15*grad[k]; nx[k]=cur[k]+lr[k]*lrs*mom[k]; });
+    const nc=clampP(nx), na=analyzePA(nc), nf=fitness(na);
+    if (nf>f){cur=nc;a=na;f=nf;lrs=Math.min(lrs*1.05,2);}else lrs*=.6;
+  }
+  return best;
+}
+
+function runNM(start, maxIter) {
+  const keys=Object.keys(PDEFS), n=keys.length;
+  const toArr=p=>keys.map(k=>p[k]), toObj=arr=>{const o={};keys.forEach((k,i)=>o[k]=arr[i]);return o;};
+  const ev=arr=>{const p=clampP(toObj(arr)), a=analyzePA(p);return{arr:toArr(p),params:p,fitness:fitness(a),a};};
+  const simp=[ev(toArr(start))];
+  keys.forEach((k,i)=>{const v=[...toArr(start)];v[i]+=(PDEFS[k].max-PDEFS[k].min)*.1;simp.push(ev(v));});
+  let best={fitness:simp[0].fitness,params:simp[0].params,a:simp[0].a};
+  for (let it=0;it<maxIter;it++) {
+    simp.sort((a,b)=>b.fitness-a.fitness);
+    if (simp[0].fitness>best.fitness){best={fitness:simp[0].fitness,params:{...simp[0].params},a:simp[0].a};}
+    if (best.fitness>.97) break;
+    const cen=new Array(n).fill(0);
+    for(let i=0;i<n;i++) simp[i].arr.forEach((v,j)=>{cen[j]+=v/n;});
+    const ref=ev(cen.map((c,j)=>c+(c-simp[n].arr[j])));
+    if(ref.fitness>simp[n-1].fitness&&ref.fitness<=simp[0].fitness){simp[n]=ref;continue;}
+    if(ref.fitness>simp[0].fitness){const exp=ev(cen.map((c,j)=>c+2*(ref.arr[j]-c)));simp[n]=exp.fitness>ref.fitness?exp:ref;continue;}
+    const con=ev(cen.map((c,j)=>c+.5*(simp[n].arr[j]-c)));
+    if(con.fitness>simp[n].fitness){simp[n]=con;continue;}
+    for(let i=1;i<=n;i++) simp[i]=ev(simp[0].arr.map((b,j)=>b+.5*(simp[i].arr[j]-b)));
+  }
+  return best;
+}
+
+function runAS(start, maxIter) {
+  const open=[], closed=new Set(), openSet=new Set();
+  const key=p=>`${p.Wd}_${p.Wf}_${p.Ld}_${p.Lm}_${p.Vgs}`;
+  const a0=analyzePA(start), f0=fitness(a0);
+  open.push({params:{...start},g:0,f:1-f0,fitness:f0,a:a0}); openSet.add(key(start));
+  let best={fitness:f0,params:{...start},a:a0}, iter=0;
+  while (open.length>0&&iter<maxIter) {
+    open.sort((a,b)=>a.f-b.f);
+    const cur=open.shift(); const ck=key(cur.params); openSet.delete(ck);
+    if (closed.has(ck)) continue; closed.add(ck); iter++;
+    if (cur.fitness>best.fitness) best={fitness:cur.fitness,params:{...cur.params},a:cur.a};
+    if (best.fitness>.97) break;
+    Object.entries(PDEFS).forEach(([k,d])=>{
+      [-1,1].forEach(dir=>{
+        const np=clampP({...cur.params,[k]:cur.params[k]+dir*d.step});
+        const nk=key(np); if(closed.has(nk)||openSet.has(nk)) return;
+        const na=analyzePA(np), nf=fitness(na);
+        open.push({params:np,g:cur.g+1,f:(cur.g+1)*.007+(1-nf),fitness:nf,a:na}); openSet.add(nk);
+      });
+    });
+    if (open.length>300) { open.sort((a,b)=>a.f-b.f); open.splice(200).forEach(n=>openSet.delete(key(n.params))); }
+  }
+  return best;
+}
+
+function runCascadeUser(start) { let r1 = runNM(start, 100); return runGD(r1.params, 100); }
+function runCascadeAI(start) { let r1 = runAS(start, 100); return runGD(r1.params, 100); }
+
+document.getElementById('runBtn').addEventListener('click', () => {
+  document.getElementById('runBtn').textContent = '🔄 跑分計算中 (請稍候)...';
+  document.getElementById('runBtn').disabled = true;
+  
+  setTimeout(() => {
+    const methods = [
+      { id: 'GD', name: 'GD Only', color: '#0ea5e9', fn: p => runGD(p, 200) },
+      { id: 'NM', name: 'NM Only', color: '#4ade80', fn: p => runNM(p, 200) },
+      { id: 'AS', name: 'A* Only', color: '#f472b6', fn: p => runAS(p, 200) },
+      { id: 'CascU', name: 'Cascade User (NM→GD)', color: '#f0c040', fn: p => runCascadeUser(p) },
+      { id: 'CascAI', name: 'Cascade AI (A*→GD)', color: '#c084fc', fn: p => runCascadeAI(p) }
+    ];
+    
+    const results = {};
+    methods.forEach(m => results[m.id] = []);
+    
+    for(let seed=2001; seed<=2010; seed++) {
+      rng = seedRandom(seed);
+      const startParam = clampP({
+        Wd: PDEFS.Wd.min + rng()*(PDEFS.Wd.max-PDEFS.Wd.min),
+        Wf: PDEFS.Wf.min + rng()*(PDEFS.Wf.max-PDEFS.Wf.min),
+        Ld: PDEFS.Ld.min + rng()*(PDEFS.Ld.max-PDEFS.Ld.min),
+        Lm: PDEFS.Lm.min + rng()*(PDEFS.Lm.max-PDEFS.Lm.min),
+        Vgs:PDEFS.Vgs.min+ rng()*(PDEFS.Vgs.max-PDEFS.Vgs.min)
+      });
+      
+      methods.forEach(m => {
+        rng = seedRandom(seed); 
+        const res = m.fn(startParam);
+        results[m.id].push({ seed, ...res });
+      });
+    }
+
+    renderDash(methods, results);
+    document.getElementById('runBtn').textContent = '✅ Benchmark 完成 (可點擊重新執行)';
+    document.getElementById('runBtn').disabled = false;
+  }, 50);
+});
+
+let chartBar = null;
+function renderDash(methods, results) {
+  document.getElementById('dash').style.display = 'block';
+  const tablesArea = document.getElementById('tablesArea');
+  tablesArea.innerHTML = '';
+  
+  methods.forEach(m => {
+    const data = results[m.id];
+    let html = `<div class="table-card"><h3 style="color:${m.color}">${m.name} 跑分結果</h3><table>
+        <tr><th>Seed</th><th>Gain (dB)</th><th>Pout (dBm)</th><th>PAE (%)</th><th>OP1dB (dBm)</th><th>S₁₁ (dB)</th><th>Fit Score</th></tr>`;
+    
+    data.forEach(row => {
+      // 判定是否符合規格 (Out of Spec)，未達標則套用 out-of-spec class，否則套用原本的顏色 class
+      let cGain = (row.a.Gain < SPECS.gain.min) ? 'out-of-spec' : 'cyan';
+      let cPout = (row.a.Pout_dBm < SPECS.pout.min) ? 'out-of-spec' : 'gold';
+      let cPAE = (row.a.PAE < SPECS.pae.min) ? 'out-of-spec' : 'green';
+      let cOP1 = (row.a.OP1dB < SPECS.op1db.min) ? 'out-of-spec' : '';
+      let cS11 = (row.a.S11 > SPECS.s11.max) ? 'out-of-spec' : '';
+
+      html += `<tr>
+        <td>${row.seed}</td>
+        <td class="${cGain}">${row.a.Gain.toFixed(2)}</td>
+        <td class="${cPout}">${row.a.Pout_dBm.toFixed(2)}</td>
+        <td class="${cPAE}">${row.a.PAE.toFixed(1)}</td>
+        <td class="${cOP1}">${row.a.OP1dB.toFixed(2)}</td>
+        <td class="${cS11}">${row.a.S11.toFixed(1)}</td>
+        <td>${(row.fitness*100).toFixed(1)}%</td>
+      </tr>`;
+    });
+    html += `</table></div>`;
+    tablesArea.innerHTML += html;
+  });
+
+  const ctx = document.getElementById('barChart').getContext('2d');
+  if(chartBar) chartBar.destroy();
+  const avgFit = methods.map(m => (results[m.id].reduce((acc, curr) => acc + curr.fitness, 0) / 10 * 100).toFixed(2));
+
+  chartBar = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: methods.map(m => m.name),
+      datasets: [{ label: 'Average Fitness Score (%)', data: avgFit, backgroundColor: methods.map(m => m.color + 'aa'), borderColor: methods.map(m => m.color), borderWidth: 1, borderRadius: 4 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { title: { display: true, text: '演算法穩定度評估 (10 Seeds 平均 Fitness)', color: '#e0e0ec', font: {size: 16} }, legend: { display: false } },
+      scales: {
+        y: { grid: { color: 'rgba(255, 255, 255, 0.05)' }, ticks: { color: '#94a3b8' }, min: 60, max: 100, title: { display: true, text: 'Fitness Score (%)', color: '#94a3b8' } },
+        x: { grid: { display: false }, ticks: { color: '#e0e0ec', font: {size: 13, weight: 'bold'} } }
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>
